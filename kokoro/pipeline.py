@@ -1,7 +1,9 @@
+import warnings
+warnings.filterwarnings("ignore", message="dropout option adds dropout after all but last recurrent layer")
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.nn.utils.weight_norm.*")
+
 from .model import KModel
 from dataclasses import dataclass
-from huggingface_hub import hf_hub_download
-from loguru import logger
 from misaki import en, espeak
 from typing import Callable, Generator, List, Optional, Tuple, Union
 import re
@@ -64,26 +66,15 @@ class KPipeline:
     def __init__(
         self,
         lang_code: str,
-        repo_id: Optional[str] = None,
+        model_path: str,
+        config_path: str,
+        voice_path: str,
         model: Union[KModel, bool] = True,
         trf: bool = False,
         en_callable: Optional[Callable[[str], str]] = None,
-        device: Optional[str] = None
+        device: Optional[str] = None,
+        disable_complex: Optional[bool] = True
     ):
-        """Initialize a KPipeline.
-        
-        Args:
-            lang_code: Language code for G2P processing
-            model: KModel instance, True to create new model, False for no model
-            trf: Whether to use transformer-based G2P
-            device: Override default device selection ('cuda' or 'cpu', or None for auto)
-                   If None, will auto-select cuda if available
-                   If 'cuda' and not available, will explicitly raise an error
-        """
-        if repo_id is None:
-            repo_id = 'hexgrad/Kokoro-82M'
-            print(f"WARNING: Defaulting repo_id to {repo_id}. Pass repo_id='{repo_id}' to suppress this warning.")
-        self.repo_id = repo_id
         lang_code = lang_code.lower()
         lang_code = ALIASES.get(lang_code, lang_code)
         assert lang_code in LANG_CODES, (lang_code, LANG_CODES)
@@ -105,76 +96,26 @@ class KPipeline:
                     device = 'mps'
                 else:
                     device = 'cpu'
-            try:
-                self.model = KModel(repo_id=repo_id).to(device).eval()
-            except RuntimeError as e:
-                if device == 'cuda':
-                    raise RuntimeError(f"""Failed to initialize model on CUDA: {e}. 
-                                       Try setting device='cpu' or check CUDA installation.""")
-                raise
-        self.voices = {}
+            # Disable complex gives mega speedup
+            self.model = KModel(config_path=config_path, model_path=model_path, disable_complex=disable_complex).to(device).eval()
+
+        self.voice = torch.load(voice_path, weights_only=True)
+
         if lang_code in 'ab':
             try:
                 fallback = espeak.EspeakFallback(british=lang_code=='b')
             except Exception as e:
-                logger.warning("EspeakFallback not Enabled: OOD words will be skipped")
-                logger.warning({str(e)})
                 fallback = None
             self.g2p = en.G2P(trf=trf, british=lang_code=='b', fallback=fallback, unk='')
         elif lang_code == 'j':
-            try:
-                from misaki import ja
-                self.g2p = ja.JAG2P()
-            except ImportError:
-                logger.error("You need to `pip install misaki[ja]` to use lang_code='j'")
-                raise
+            from misaki import ja
+            self.g2p = ja.JAG2P()
         elif lang_code == 'z':
-            try:
-                from misaki import zh
-                self.g2p = zh.ZHG2P(
-                    version=None if repo_id.endswith('/Kokoro-82M') else '1.1',
-                    en_callable=en_callable
-                )
-            except ImportError:
-                logger.error("You need to `pip install misaki[zh]` to use lang_code='z'")
-                raise
+            from misaki import zh
+            self.g2p = zh.ZHG2P(version=None, en_callable=en_callable)
         else:
             language = LANG_CODES[lang_code]
-            logger.warning(f"Using EspeakG2P(language='{language}'). Chunking logic not yet implemented, so long texts may be truncated unless you split them with '\\n'.")
             self.g2p = espeak.EspeakG2P(language=language)
-
-    def load_single_voice(self, voice: str):
-        if voice in self.voices:
-            return self.voices[voice]
-        if voice.endswith('.pt'):
-            f = voice
-        else:
-            f = hf_hub_download(repo_id=self.repo_id, filename=f'voices/{voice}.pt')
-            if not voice.startswith(self.lang_code):
-                v = LANG_CODES.get(voice, voice)
-                p = LANG_CODES.get(self.lang_code, self.lang_code)
-                logger.warning(f'Language mismatch, loading {v} voice into {p} pipeline.')
-        pack = torch.load(f, weights_only=True)
-        self.voices[voice] = pack
-        return pack
-
-    """
-    load_voice is a helper function that lazily downloads and loads a voice:
-    Single voice can be requested (e.g. 'af_bella') or multiple voices (e.g. 'af_bella,af_jessica').
-    If multiple voices are requested, they are averaged.
-    Delimiter is optional and defaults to ','.
-    """
-    def load_voice(self, voice: Union[str, torch.FloatTensor], delimiter: str = ",") -> torch.FloatTensor:
-        if isinstance(voice, torch.FloatTensor):
-            return voice
-        if voice in self.voices:
-            return self.voices[voice]
-        logger.debug(f"Loading voice: {voice}")
-        packs = [self.load_single_voice(v) for v in voice.split(delimiter)]
-        if len(packs) == 1:
-            return packs[0]
-        self.voices[voice] = torch.mean(torch.stack(packs), dim=0)
-        return self.voices[voice]
 
     @staticmethod
     def tokens_to_ps(tokens: List[en.MToken]) -> str:
@@ -210,13 +151,12 @@ class KPipeline:
         pcount = 0
         for t in tokens:
             # American English: ɾ => T
-            t.phonemes = '' if t.phonemes is None else t.phonemes#.replace('ɾ', 'T')
+            t.phonemes = '' if t.phonemes is None else t.phonemes
             next_ps = t.phonemes + (' ' if t.whitespace else '')
             next_pcount = pcount + len(next_ps.rstrip())
             if next_pcount > 510:
                 z = KPipeline.waterfall_last(tks, next_pcount)
                 text = KPipeline.tokens_to_text(tks[:z])
-                logger.debug(f"Chunking text at {z}: '{text[:30]}{'...' if len(text) > 30 else ''}'")
                 ps = KPipeline.tokens_to_ps(tks[:z])
                 yield text, ps, tks[:z]
                 tks = tks[z:]
@@ -244,7 +184,6 @@ class KPipeline:
     def generate_from_tokens(
         self,
         tokens: Union[str, List[en.MToken]],
-        voice: str,
         speed: float = 1,
         model: Optional[KModel] = None
     ) -> Generator['KPipeline.Result', None, None]:
@@ -263,28 +202,19 @@ class KPipeline:
             ValueError: If no voice is provided or token sequence exceeds model limits
         """
         model = model or self.model
-        if model and voice is None:
-            raise ValueError('Specify a voice: pipeline.generate_from_tokens(..., voice="af_heart")')
-        
-        pack = self.load_voice(voice).to(model.device) if model else None
-
-        # Handle raw phoneme string
+        pack = self.voice.to(model.device) if model else None
         if isinstance(tokens, str):
-            logger.debug("Processing phonemes from raw string")
             if len(tokens) > 510:
                 raise ValueError(f'Phoneme string too long: {len(tokens)} > 510')
             output = KPipeline.infer(model, tokens, pack, speed) if model else None
             yield self.Result(graphemes='', phonemes=tokens, output=output)
             return
         
-        logger.debug("Processing MTokens")
         # Handle pre-processed tokens
         for gs, ps, tks in self.en_tokenize(tokens):
             if not ps:
                 continue
             elif len(ps) > 510:
-                logger.warning(f"Unexpected len(ps) == {len(ps)} > 510 and ps == '{ps}'")
-                logger.warning("Truncating to 510 characters")
                 ps = ps[:510]
             output = KPipeline.infer(model, ps, pack, speed) if model else None
             if output is not None and output.pred_dur is not None:
@@ -361,17 +291,12 @@ class KPipeline:
     def __call__(
         self,
         text: Union[str, List[str]],
-        voice: Optional[str] = None,
         speed: Union[float, Callable[[int], float]] = 1,
         split_pattern: Optional[str] = r'\n+',
         model: Optional[KModel] = None
     ) -> Generator['KPipeline.Result', None, None]:
         model = model or self.model
-        if model and voice is None:
-            raise ValueError('Specify a voice: en_us_pipeline(text="Hello world!", voice="af_heart")')
-        pack = self.load_voice(voice).to(model.device) if model else None
-        
-        # Convert input to list of segments
+        pack = self.voice.to(model.device) if model else None
         if isinstance(text, str):
             text = re.split(split_pattern, text.strip()) if split_pattern else [text]
             
@@ -382,13 +307,11 @@ class KPipeline:
                 
             # English processing (unchanged)
             if self.lang_code in 'ab':
-                logger.debug(f"Processing English text: {graphemes[:50]}{'...' if len(graphemes) > 50 else ''}")
                 _, tokens = self.g2p(graphemes)
                 for gs, ps, tks in self.en_tokenize(tokens):
                     if not ps:
                         continue
                     elif len(ps) > 510:
-                        logger.warning(f"Unexpected len(ps) == {len(ps)} > 510 and ps == '{ps}'")
                         ps = ps[:510]
                     output = KPipeline.infer(model, ps, pack, speed) if model else None
                     if output is not None and output.pred_dur is not None:
@@ -435,7 +358,6 @@ class KPipeline:
                     if not ps:
                         continue
                     elif len(ps) > 510:
-                        logger.warning(f'Truncating len(ps) == {len(ps)} > 510')
                         ps = ps[:510]
                         
                     output = KPipeline.infer(model, ps, pack, speed) if model else None
